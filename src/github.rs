@@ -1,3 +1,4 @@
+use crate::test_record;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,15 +31,18 @@ impl GithubClient {
             .build()
             .with_context(|| format!("building reqwest {}", req_dbg))?;
 
+        let test_capture_info = test_record::capture_request(&req);
         let mut resp = self.client.execute(req.try_clone().unwrap()).await?;
         if let Some(sleep) = Self::needs_retry(&resp).await {
             resp = self.retry(req, sleep, MAX_ATTEMPTS).await?;
         }
+        let status = resp.status();
         let maybe_err = resp.error_for_status_ref().err();
         let body = resp
             .bytes()
             .await
             .with_context(|| format!("failed to read response body {req_dbg}"))?;
+        test_record::record_request(test_capture_info, status, &body);
         if let Some(e) = maybe_err {
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("response: {}", String::from_utf8_lossy(&body)));
@@ -247,7 +251,7 @@ pub struct Issue {
     pub number: u64,
     #[serde(deserialize_with = "opt_string")]
     pub body: String,
-    created_at: chrono::DateTime<Utc>,
+    pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
     /// The SHA for a merge commit.
     ///
@@ -263,6 +267,7 @@ pub struct Issue {
     pub html_url: String,
     pub user: User,
     pub labels: Vec<Label>,
+    pub milestone: Option<Milestone>,
     pub assignees: Vec<User>,
     /// Indicator if this is a pull request.
     ///
@@ -329,6 +334,7 @@ impl ZulipGitHubReference {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Comment {
+    pub id: i64,
     #[serde(deserialize_with = "opt_string")]
     pub body: String,
     pub html_url: String,
@@ -475,10 +481,20 @@ impl Issue {
         self.state == IssueState::Open
     }
 
-    pub async fn get_comment(&self, client: &GithubClient, id: usize) -> anyhow::Result<Comment> {
+    pub async fn get_comment(&self, client: &GithubClient, id: u64) -> anyhow::Result<Comment> {
         let comment_url = format!("{}/issues/comments/{}", self.repository().url(client), id);
         let comment = client.json(client.get(&comment_url)).await?;
         Ok(comment)
+    }
+
+    pub async fn get_comments(&self, client: &GithubClient) -> anyhow::Result<Vec<Comment>> {
+        let comment_url = format!(
+            "{}/issues/{}/comments",
+            self.repository().url(client),
+            self.number
+        );
+        let comments = client.json(client.get(&comment_url)).await?;
+        Ok(comments)
     }
 
     pub async fn edit_body(&self, client: &GithubClient, body: &str) -> anyhow::Result<()> {
@@ -854,8 +870,8 @@ struct MilestoneCreateBody<'a> {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Milestone {
-    number: u64,
-    title: String,
+    pub number: u64,
+    pub title: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1064,6 +1080,15 @@ impl Repository {
             || filters.iter().any(|&(key, _)| key == "no")
             || is_pr && !include_labels.is_empty();
 
+        let set_is_pr = |issues: &mut [Issue]| {
+            if !is_pr {
+                return;
+            }
+            for issue in issues {
+                issue.pull_request = Some(PullRequestDetails {});
+            }
+        };
+
         // If there are more than `per_page` of issues, we need to paginate
         let mut issues = vec![];
         loop {
@@ -1083,10 +1108,11 @@ impl Repository {
 
             let result = client.get(&url);
             if use_search_api {
-                let result = client
+                let mut result = client
                     .json::<IssueSearchResult>(result)
                     .await
                     .with_context(|| format!("failed to list issues from {}", url))?;
+                set_is_pr(&mut result.items);
                 issues.extend(result.items);
                 if issues.len() < result.total_count {
                     ordering.page += 1;
@@ -1097,7 +1123,8 @@ impl Repository {
                 issues = client
                     .json(result)
                     .await
-                    .with_context(|| format!("failed to list issues from {}", url))?
+                    .with_context(|| format!("failed to list issues from {}", url))?;
+                set_is_pr(&mut issues);
             }
 
             break;
@@ -1237,7 +1264,7 @@ impl Repository {
         client: &GithubClient,
         refname: &str,
         sha: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<GitReference> {
         let url = format!("{}/git/refs/{}", self.url(client), refname);
         client
             .json(client.patch(&url).json(&serde_json::json!({
@@ -1250,8 +1277,7 @@ impl Repository {
                     "{} failed to update reference {refname} to {sha}",
                     self.full_name
                 )
-            })?;
-        Ok(())
+            })
     }
 
     /// Returns a list of recent commits on the given branch.
@@ -1510,6 +1536,16 @@ impl Repository {
                 )
             })?;
         Ok(())
+    }
+
+    pub async fn get_pr(&self, client: &GithubClient, number: u64) -> anyhow::Result<Issue> {
+        let url = format!("{}/pulls/{number}", self.url(client));
+        let mut pr: Issue = client
+            .json(client.get(&url))
+            .await
+            .with_context(|| format!("{} failed to get pr {number}", self.full_name))?;
+        pr.pull_request = Some(PullRequestDetails {});
+        Ok(pr)
     }
 }
 
@@ -1812,12 +1848,14 @@ impl GithubClient {
         let req = req
             .build()
             .with_context(|| format!("failed to build request {:?}", req_dbg))?;
+        let test_capture_info = test_record::capture_request(&req);
         let resp = self.client.execute(req).await.context(req_dbg.clone())?;
         let status = resp.status();
         let body = resp
             .bytes()
             .await
             .with_context(|| format!("failed to read response body {req_dbg}"))?;
+        test_record::record_request(test_capture_info, status, &body);
         match status {
             StatusCode::OK => Ok(Some(body)),
             StatusCode::NOT_FOUND => Ok(None),
@@ -1970,6 +2008,7 @@ pub struct GitTreeEntry {
     pub sha: String,
 }
 
+#[derive(Debug)]
 pub struct RecentCommit {
     pub title: String,
     pub pr_num: Option<i32>,
