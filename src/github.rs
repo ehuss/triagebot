@@ -982,6 +982,11 @@ pub struct IssueSearchResult {
     pub items: Vec<Issue>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CommitSearchResult {
+    total_count: u32,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct Repository {
     pub full_name: String,
@@ -1921,18 +1926,29 @@ impl GithubClient {
     /// Returns whether or not the given GitHub login has made any commits to
     /// the given repo.
     pub async fn is_new_contributor(&self, repo: &Repository, author: &str) -> bool {
+        if repo.fork {
+            // GitHub always returns 0 results in forked repos, so this cannot
+            // work for them.
+            return false;
+        }
+        // Note: There are two ways this can work. Either the
+        // `repos/ORG/REPO/commits?author=AUTHOR` API, or the
+        // `/search/commits` API. The former works on forks, and has a more
+        // permissive rate limit. However, we've been having problems with
+        // users not appearing in the list commits API
+        // (https://github.com/rust-lang/triagebot/issues/1689), so this uses
+        // the search API instead. Unfortunately this means it won't work on
+        // forks. The rate limit shouldn't be a problem (I think it is
+        // 30/minute).
         let url = format!(
-            "{}/repos/{}/commits?author={}",
+            "{}/search/commits?q=repo:{}+author:{}",
             Repository::GITHUB_API_URL,
             repo.full_name,
             author,
         );
         let req = self.get(&url);
-        match self.json::<Vec<GithubCommit>>(req).await {
-            // Note: This only returns results for the default branch.
-            // That should be fine in most cases since I think it is rare for
-            // new users to make their first commit to a different branch.
-            Ok(res) => res.is_empty(),
+        match self.json::<CommitSearchResult>(req).await {
+            Ok(res) => res.total_count == 0,
             Err(e) => {
                 log::warn!(
                     "failed to search for user commits in {} for author {author}: {e:?}",
